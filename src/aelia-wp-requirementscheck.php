@@ -90,18 +90,39 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 		// @var array Holds a list of the errors related to missing requirements
 		protected $requirements_errors = array();
 
+		// @var array Contains a list of actions to rectify a missing plugin requirement
+		// (e.g. commands to install or activate the plugin)
+		protected $plugin_actions = array();
+
 		public function __construct() {
 			// Require necessary WP Core files
 			if(!function_exists('get_plugins')) {
 				require_once(ABSPATH . 'wp-admin/includes/plugin.php');
 			}
-			if(!function_exists('wp_create_nonce')) {
-				require_once(ABSPATH . WPINC . '/pluggable.php');
-			}
+
+			// Ensure that all plugin requirements are in array format
+			$this->normalize_plugin_requirements();
 
 			// Ajax hooks
 			add_action('wp_ajax_' . $this->get_ajax_action('install'), array($this, 'wp_ajax_install_plugin'));
 			add_action('wp_ajax_' . $this->get_ajax_action('activate'), array($this, 'wp_ajax_activate_plugin'));
+		}
+
+		/**
+		 * Normalizes the format of the plugin requirements list. This operation is
+		 * necessary for backward compatibility, as the plugin requirements might
+		 * just contain the plugin version, rather than an array of plugin details.
+		 */
+		protected function normalize_plugin_requirements() {
+			foreach($this->required_plugins as $plugin_name => $plugin_requirements) {
+				// If plugin_details is not an array, it's assumed to be a string containing
+				// the required plugin version
+				if(!is_array($plugin_requirements)) {
+					$this->required_plugins[$plugin_name] = array(
+						'version' => $plugin_requirements,
+					);
+				}
+			}
 		}
 
 		/**
@@ -121,7 +142,6 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 		 *
 		 * @param string action The action key ("install" or "activate").
 		 * @return string
-		 * @since 1.5.0.150225
 		 */
 		protected function get_ajax_action($action) {
 			return $action . '_plugin_' . sha1(get_class($this));
@@ -184,48 +204,20 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 			foreach($this->required_plugins as $plugin_name => $plugin_requirements) {
 				$plugin_info = $this->get_wp_plugin_info($plugin_name);
 
-				// If plugin_details is not an array, it's assumed to be a string containing
-				// the required plugin version
-				if(!is_array($plugin_requirements)) {
-					$plugin_requirements = array(
-						'version' => $plugin_requirements,
-					);
-				}
-
 				$message = '';
-				$plugin_slug = sanitize_title($plugin_name);
-				// Build the plugin wrapper that will contain the link to install or
-				// activate the plugin
-				$plugin_action_wrapper = '<span class="plugin_action_wrapper">';
-				$plugin_action_wrapper .= '<span class="spinner"></span>%s';
-				$plugin_action_wrapper .= '<div class="plugin_action_result"><pre class="messages"></pre></div>';
-				$plugin_action_wrapper .= '</span>';
-
 				if(!is_array($plugin_info)) {
 					// Plugin is not installed. Check if it can be installed automatically
 					// and provide a button to do it
-					if(filter_var($plugin_requirements['url'], FILTER_VALIDATE_URL)) {
+					if(isset($plugin_requirements['url']) && filter_var($plugin_requirements['url'], FILTER_VALIDATE_URL)) {
 						// Debug
 						//var_dump($plugin_requirements['url']);
-						$plugin_install_url = $this->get_ajax_url($plugin_name, 'install');
-						$plugin_action = '<a href="' . $plugin_install_url . '" ' .
-														 'class="plugin_action button" ' .
-														 'plugin_slug="' . $plugin_slug . '" ' .
-														 'prompt="install" ' .
-														 'ajax_url="' . $plugin_install_url . '">';
-						$plugin_action .= __('Install plugin', $this->text_domain);
-						$plugin_action .= '</a>';
+						$this->plugin_actions[$plugin_name] = 'install';
 					}
 				}
 				else {
 					if(!$plugin_info['active']) {
-						// Plugin is installed, but not active. Add button to activate it
-						$plugin_action = '<a href="#" class="plugin_action button" ' .
-														 'plugin_slug="' . $plugin_slug . '" ' .
-														 'prompt="activate" ' .
-														 'ajax_url="' . $this->get_ajax_url($plugin_name, 'activate') . '">';
-						$plugin_action .= __('Activate plugin', $this->text_domain);
-						$plugin_action .= '</a>';
+						// If plugin can be activated, provide a button to do it
+						$this->plugin_actions[$plugin_name] = 'activate';
 					}
 				}
 
@@ -252,11 +244,7 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 					if(isset($plugin_requirements['extra_info'])) {
 						$message .= ' ' . $plugin_requirements['extra_info'];
 					}
-
-					if(!empty($plugin_action)) {
-						$message .= sprintf($plugin_action_wrapper, $plugin_action);
-					}
-					$this->requirements_errors[] = $message;
+					$this->requirements_errors[$plugin_name] = $message;
 				}
 			}
 		}
@@ -337,15 +325,20 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 		 * @since 1.5.0.150225
 		 */
 		protected function get_wp_plugin_info($plugin_name) {
-			foreach($this->installed_plugins() as $path => $plugin_info){
-				if(strcasecmp($plugin_info['Name'], $plugin_name) === 0) {
-					$plugin_info['path'] = $path;
-					$plugin_info['active'] = is_plugin_active($path);
-					$plugin_info = array_change_key_case($plugin_info, CASE_LOWER);
-					return $plugin_info;
+			if(empty(self::$_plugins_info[$plugin_name])) {
+				self::$_plugins_info[$plugin_name] = false;
+				foreach($this->installed_plugins() as $path => $plugin_info){
+					if(strcasecmp($plugin_info['Name'], $plugin_name) === 0) {
+						$plugin_info['path'] = $path;
+						$plugin_info['active'] = is_plugin_active($path);
+						$plugin_info = array_change_key_case($plugin_info, CASE_LOWER);
+
+						self::$_plugins_info[$plugin_name] = $plugin_info;
+						break;
+					}
 				}
 			}
-			return false;
+			return self::$_plugins_info[$plugin_name];
 		}
 
 		/**
@@ -386,11 +379,76 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 		}
 
 		/**
+		 * Returns the snippet of HTML code that allows to automatically install or
+		 * activate a plugin. The method returns an empty string if none of such
+		 * operations is possible.
+		 *
+		 * @param string plugin_name The name of the plugin to be installed or
+		 * activated automatically.
+		 * @return string The HTML snippet with the appropriate action (install/activate),
+		 * or an empty string if neither action is possible.
+		 * @since 1.5.4.150316
+		 */
+		protected function get_plugin_action_html($plugin_name) {
+			if(empty($this->plugin_actions[$plugin_name])) {
+				return '';
+			}
+
+			$plugin_action = $this->plugin_actions[$plugin_name];
+			$plugin_slug = sanitize_title($plugin_name);
+			$action_html = '';
+			switch($plugin_action) {
+				case 'install':
+					$plugin_install_url = $this->get_ajax_url($plugin_name, 'install');
+					$plugin_action = '<a href="' . $plugin_install_url . '" ' .
+													 'class="plugin_action button" ' .
+													 'plugin_slug="' . $plugin_slug . '" ' .
+													 'prompt="install" ' .
+													 'ajax_url="' . $plugin_install_url . '">';
+					$plugin_action .= __('Install plugin', $this->text_domain);
+					$plugin_action .= '</a>';
+					break;
+				case 'activate':
+					// Plugin is installed, but not active. Add button to activate it
+					$plugin_action = '<a href="#" class="plugin_action button" ' .
+													 'plugin_slug="' . $plugin_slug . '" ' .
+													 'prompt="activate" ' .
+													 'ajax_url="' . $this->get_ajax_url($plugin_name, 'activate') . '">';
+					$plugin_action .= __('Activate plugin', $this->text_domain);
+					$plugin_action .= '</a>';
+					break;
+				default:
+					// Nothing to do
+			}
+
+			if(!empty($plugin_action)) {
+				// Build the plugin wrapper that will contain the link to install or
+				// activate the plugin
+				$plugin_action_wrapper = '<span class="plugin_action_wrapper">';
+				$plugin_action_wrapper .= '<span class="spinner"></span>%s';
+				$plugin_action_wrapper .= '<div class="plugin_action_result"><pre class="messages"></pre></div>';
+				$plugin_action_wrapper .= '</span>';
+
+				$action_html = sprintf($plugin_action_wrapper, $plugin_action);
+			}
+			return $action_html;
+		}
+
+		/**
 		 * Display requirements errors that prevented the plugin from being loaded.
 		 */
 		public function plugin_requirements_notices() {
 			if(empty($this->requirements_errors)) {
 				return;
+			}
+
+			// For each missing plugin, check if it's possible to install or activate
+			// it automatically. If it's possible, render a button to allow the administrator
+			// to do so
+			foreach($this->requirements_errors as $plugin_name => $message) {
+				if(is_string($plugin_name)) {
+					$this->requirements_errors[$plugin_name] .= $this->get_plugin_action_html($plugin_name);
+				}
 			}
 			?>
 			<style type="text/css">
@@ -401,8 +459,13 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 					float: none;
 				}
 
+				.wp_aelia.message .spinner {
+					display: none;
+				}
+
 				.wp_aelia.message .spinner.visible {
 					display: inline-block;
+					visibility: visible;
 				}
 			</style>
 			<div class="wp_aelia message error fade">
@@ -420,7 +483,9 @@ if(!class_exists('Aelia_WP_Requirements_Checker')) {
 				echo __('Please review the missing requirements listed above, and ensure ' .
 								'that all necessary plugins and PHP extensions are installed and ' .
 								'loaded correctly. This plugin will work automatically as soon as all the ' .
-								'requirements are met. If you need assistance, please contact our Support team.',
+								'requirements are met. If you need assistance on this matter, please ' .
+								'<a href="https://aelia.freshdesk.com/helpdesk/tickets/new">contact our ' .
+								'Support team</a>.',
 								$this->text_domain);
 				?></p>
 			</div>
